@@ -5,28 +5,27 @@ namespace SilverStripe\SAML\Control;
 use Exception;
 
 use function gmmktime;
-
+use function uniqid;
 use OneLogin\Saml2\Auth;
 use OneLogin\Saml2\Constants;
-use OneLogin\Saml2\Utils;
 use OneLogin\Saml2\Error;
+use OneLogin\Saml2\Utils;
 use Psr\Log\LoggerInterface;
+use SilverStripe\Control\Controller;
+use SilverStripe\Control\Director;
+use SilverStripe\Control\HTTPResponse;
 use SilverStripe\Core\Config\Config;
+use SilverStripe\Core\Injector\Injector;
 use SilverStripe\ORM\ValidationResult;
 use SilverStripe\SAML\Authenticators\SAMLAuthenticator;
 use SilverStripe\SAML\Authenticators\SAMLLoginForm;
 use SilverStripe\SAML\Helpers\SAMLHelper;
-use SilverStripe\Control\Controller;
-use SilverStripe\Control\Director;
-use SilverStripe\Control\HTTPResponse;
-use SilverStripe\Core\Injector\Injector;
+use SilverStripe\SAML\Helpers\SAMLUserGroupMapper;
 use SilverStripe\SAML\Model\SAMLResponse;
 use SilverStripe\SAML\Services\SAMLConfiguration;
 use SilverStripe\Security\IdentityStore;
 use SilverStripe\Security\Member;
 use SilverStripe\Security\Security;
-
-use function uniqid;
 
 /**
  * Class SAMLController
@@ -201,7 +200,7 @@ class SAMLController extends Controller
                 $this->getLogger()->warning(
                     sprintf(
                         'Claim rule \'%s\' configured in SAMLMemberExtension.claims_field_mappings, ' .
-                            'but wasn\'t passed through. Please check IdP claim rules.',
+                        'but wasn\'t passed through. Please check IdP claim rules.',
                         $claim
                     )
                 );
@@ -222,6 +221,14 @@ class SAMLController extends Controller
 
         // Hook for modifying login behaviour
         $this->extend('updateLogin');
+
+        $mapUserGroup = Config::inst()->get(SAMLConfiguration::class, 'map_user_group');
+        // Map user groups
+        if ($mapUserGroup) {
+            $mapper = SAMLUserGroupMapper::singleton();
+
+            $member = $mapper->map($attributes, $member);
+        }
 
         /** @var IdentityStore $identityStore */
         $identityStore = Injector::inst()->get(IdentityStore::class);

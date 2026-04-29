@@ -4,7 +4,6 @@ namespace SilverStripe\SAML\Control;
 
 use Exception;
 use OneLogin\Saml2\Auth;
-use OneLogin\Saml2\Constants;
 use OneLogin\Saml2\Error;
 use OneLogin\Saml2\Utils;
 use Psr\Log\LoggerInterface;
@@ -12,14 +11,12 @@ use SilverStripe\Control\Controller;
 use SilverStripe\Control\Director;
 use SilverStripe\Control\HTTPResponse;
 use SilverStripe\Core\Config\Config;
-use SilverStripe\Core\Config\Config_ForClass;
 use SilverStripe\Core\Injector\Injector;
-use SilverStripe\Core\Validation\ValidationResult;
-use SilverStripe\ORM\Filters\ExactMatchFilter;
+use SilverStripe\ORM\ValidationResult;
 use SilverStripe\SAML\Authenticators\SAMLAuthenticator;
 use SilverStripe\SAML\Authenticators\SAMLLoginForm;
-use SilverStripe\SAML\Exceptions\AcsFailure;
 use SilverStripe\SAML\Helpers\SAMLHelper;
+use SilverStripe\SAML\Helpers\SAMLUserGroupMapper;
 use SilverStripe\SAML\Model\SAMLResponse;
 use SilverStripe\SAML\Services\SAMLConfiguration;
 use SilverStripe\Security\IdentityStore;
@@ -162,6 +159,187 @@ class SAMLController extends Controller
         if ($error || !$auth->isAuthenticated()) {
             throw new AcsFailure($error ?: 'Authentication failed at IdP', 0, $caughtException);
         }
+<<<<<<< HEAD
+=======
+
+        /**
+         * If processing reaches here, then the user is authenticated - the rest of this method is just processing their
+         * legitimate information and configuring their account.
+         */
+
+        $helper = SAMLHelper::singleton();
+
+        // If we expect the NameID to be a binary version of the GUID (ADFS), check that it actually is
+        // If we are configured not to expect a binary NameID, then we assume it is a direct GUID (Azure AD)
+        if (Config::inst()->get(SAMLConfiguration::class, 'expect_binary_nameid')) {
+            $decodedNameId = base64_decode($auth->getNameId());
+            if (ctype_print($decodedNameId)) {
+                $this->getForm()->sessionMessage('NameID from IdP is not a binary GUID.', ValidationResult::TYPE_ERROR);
+                $this->getRequest()->getSession()->save($this->getRequest());
+                return $this->getRedirect();
+            }
+
+            // transform the NameId to guid
+            $guid = $helper->binToStrGuid($decodedNameId);
+            $validateGuid = true;
+        } else {
+            $guid = $auth->getNameId();
+            // If you do not expect your NameId to be formatted as a valid GUID, then you can update this config to
+            // false
+            $validateGuid = Config::inst()->get(SAMLConfiguration::class, 'validate_nameid_as_guid');
+        }
+
+        if ($validateGuid && !$helper->validGuid($guid)) {
+            $errorMessage = "Not a valid GUID '{$guid}' received from server.";
+            $this->getLogger()->error($errorMessage);
+            $this->getForm()->sessionMessage($errorMessage, ValidationResult::TYPE_ERROR);
+            $this->getRequest()->getSession()->save($this->getRequest());
+            return $this->getRedirect();
+        }
+
+        $attributes = $auth->getAttributes();
+
+        // Allows setups that map GUID (email format) to email {@see SAMLConfiguration::$expose_guid_as_attribute}.
+        if (Config::inst()->get(SAMLConfiguration::class, 'expose_guid_as_attribute')) {
+            $attributes['GUID'][0] = $guid;
+        }
+
+        $this->extend('updateAttributes', $attributes);
+        $this->extend('updateGuid', $guid);
+
+        $request = $this->getRequest();
+        $this->extend('updateRequest', $request);
+        $this->setRequest($request);
+
+        $fieldToClaimMap = array_flip(Member::config()->claims_field_mappings);
+
+        // Write a rudimentary member with basic fields on every login, so that we at least have something
+        // if there is no further sync (e.g. via LDAP)
+        $member = Member::get()->filter('GUID', $guid)->limit(1)->first();
+        $insecure = Config::inst()->get(SAMLConfiguration::class, 'allow_insecure_email_linking');
+
+        if (!($member && $member->exists()) && $insecure && isset($fieldToClaimMap['Email'])) {
+            // If there is no member found via GUID and we allow linking via email, search by email
+            $att = $attributes[$fieldToClaimMap['Email']];
+            $member = Member::get()->filter('Email', $att)->limit(1)->first();
+
+            if (!($member && $member->exists())) {
+                $member = new Member();
+            }
+
+            $member->GUID = $guid;
+        } elseif (!($member && $member->exists())) {
+            // If the member doesn't exist and we don't allow linking via email, then create a new member
+            $member = new Member();
+            $member->GUID = $guid;
+        }
+
+        foreach ($member->config()->claims_field_mappings as $claim => $field) {
+            if (!isset($attributes[$claim][0])) {
+                $this->getLogger()->warning(
+                    sprintf(
+                        'Claim rule \'%s\' configured in SAMLMemberExtension.claims_field_mappings, ' .
+                        'but wasn\'t passed through. Please check IdP claim rules.',
+                        $claim
+                    )
+                );
+
+                continue;
+            }
+
+            $member->$field = $attributes[$claim][0];
+        }
+
+        $member->SAMLSessionIndex = $auth->getSessionIndex();
+
+        // This will trigger LDAP update through LDAPMemberExtension::memberLoggedIn, if the LDAP module is installed.
+        // The LDAP update will also write the Member record a second time, but the member *must* be written before
+        // IdentityStore->logIn() is called, otherwise the identity store throws an exception.
+        // Both SAML and LDAP identify Members by the same GUID field.
+        $member->write();
+
+        // Hook for modifying login behaviour
+        $this->extend('updateLogin');
+
+        $mapUserGroup = Config::inst()->get(SAMLConfiguration::class, 'map_user_group');
+        // Map user groups
+        if ($mapUserGroup) {
+            $mapper = SAMLUserGroupMapper::singleton();
+
+            $member = $mapper->map($attributes, $member);
+        }
+
+        /** @var IdentityStore $identityStore */
+        $identityStore = Injector::inst()->get(IdentityStore::class);
+        $persistent = Config::inst()->get(SAMLConfiguration::class, 'login_persistent');
+        $identityStore->logIn($member, $persistent, $this->getRequest());
+
+        return $this->getRedirect();
+    }
+
+    /**
+     * Generate this SP's metadata. This is needed for intialising the SP-IdP relationship.
+     * IdP is instructed to call us back here to establish the relationship. IdP may also be configured
+     * to hit this endpoint periodically during normal operation, to check the SP availability.
+     */
+    public function metadata()
+    {
+        try {
+            /** @var Auth $auth */
+            $auth = Injector::inst()->get(SAMLHelper::class)->getSAMLAuth();
+            $settings = $auth->getSettings();
+            $metadata = $settings->getSPMetadata();
+            $errors = $settings->validateMetadata($metadata);
+            if (empty($errors)) {
+                header('Content-Type: text/xml');
+                echo $metadata;
+            } else {
+                throw new Error(
+                    'Invalid SP metadata: ' . implode(', ', $errors),
+                    Error::METADATA_SP_INVALID
+                );
+            }
+        } catch (Exception $e) {
+            $this->getLogger()->error($e->getMessage());
+            echo $e->getMessage();
+        }
+    }
+
+    /**
+     * @return HTTPResponse
+     */
+    protected function getRedirect()
+    {
+        // Absolute redirection URLs may cause spoofing
+        $back = $this->getRequest()->getSession()->get('BackURL');
+
+        if ($back && Director::is_site_url($back)) {
+            return $this->redirect($this->getRequest()->getSession()->get('BackURL'));
+        }
+
+        // In SAMLHelper, we use RelayState to convey BackURL because in a HTTP POST flow
+        // with lax or strict cookie security the session will not be there for us. RelayState
+        // will be reflected back in the acs POST request.
+        // Note if only assertion is signed, RelayState cannot be trusted. Prevent open relay
+        // as in https://github.com/SAML-Toolkits/php-saml#avoiding-open-redirect-attacks
+        $relayState = $this->owner->getRequest()->postVar('RelayState');
+        if ($relayState && Director::is_site_url($relayState)) {
+            return $this->redirect($relayState);
+        }
+
+        // Spoofing attack, redirect to homepage instead of spoofing url
+        if ($back && !Director::is_site_url($back)) {
+            return $this->redirect(Director::absoluteBaseURL());
+        }
+
+        // If a default login dest has been set, redirect to that.
+        if ($dest = Security::config()->default_login_dest) {
+            return $this->redirect(Director::absoluteBaseURL() . $dest);
+        }
+
+        // fallback to redirect back to home page
+        return $this->redirect(Director::absoluteBaseURL());
+>>>>>>> origin/feature/user-group-mapping-cms5
     }
 
     /**

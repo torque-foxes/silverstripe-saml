@@ -10,6 +10,7 @@ use Psr\Log\LoggerInterface;
 use SilverStripe\Control\Controller;
 use SilverStripe\Control\Director;
 use SilverStripe\Control\HTTPResponse;
+use SilverStripe\Core\Config\Config;
 use SilverStripe\Core\Config\Config_ForClass;
 use SilverStripe\Core\Injector\Injector;
 use SilverStripe\ORM\Filters\ExactMatchFilter;
@@ -17,6 +18,7 @@ use SilverStripe\SAML\Authenticators\SAMLAuthenticator;
 use SilverStripe\SAML\Authenticators\SAMLLoginForm;
 use SilverStripe\SAML\Exceptions\AcsFailure;
 use SilverStripe\SAML\Helpers\SAMLHelper;
+use SilverStripe\SAML\Helpers\SAMLUserGroupMapper;
 use SilverStripe\SAML\Model\SAMLResponse;
 use SilverStripe\SAML\Services\SAMLConfiguration;
 use SilverStripe\Security\IdentityStore;
@@ -115,6 +117,16 @@ class SAMLController extends Controller
 
             // Hook for modifying login behaviour
             $this->extend('updateLogin');
+
+            // Map user groups
+            $mapUserGroup = $this->configuration->get('map_user_group');
+            if ($mapUserGroup) {
+                $mapper = SAMLUserGroupMapper::singleton();
+                $attributes = $auth->getAttributes();
+
+                $member = $mapper->map($attributes, $member);
+            }
+
             // log user in
             Injector::inst()->get(IdentityStore::class)->logIn(
                 $member,
